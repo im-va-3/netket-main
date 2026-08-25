@@ -1,0 +1,261 @@
+# Copyright 2021 The NetKet Authors - All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+import numpy as np
+import pytest
+import jax.numpy as jnp
+
+import netket as nk
+from netket.stats import LocalEstimatorsBatch, online_statistics
+from netket._src.vqs.check_mc_convergence import acf_window_saturated, tau_corr_reliable
+
+from .. import common
+
+pytestmark = common.skipif_distributed
+
+
+def ar1(phi, n_chains=8, n_samples=500, seed=42):
+    """AR(1) process x[t] = phi*x[t-1] + sqrt(1-phi^2)*noise, tau ~ (1+phi)/(1-phi)."""
+    rng = np.random.default_rng(seed)
+    data = np.zeros((n_chains, n_samples))
+    data[:, 0] = rng.standard_normal(n_chains)
+    for t in range(1, n_samples):
+        data[:, t] = phi * data[:, t - 1] + np.sqrt(1 - phi**2) * rng.standard_normal(
+            n_chains
+        )
+    return data
+
+
+@pytest.fixture()
+def vstate():
+    hi = nk.hilbert.Spin(1 / 2, N=4)
+    return nk.vqs.MCState(
+        nk.sampler.MetropolisLocal(hi),
+        nk.models.RBM(alpha=1),
+        n_samples=16,
+        seed=0,
+    )
+
+
+# --- acf_window_saturated ---
+
+
+def test_acf_saturated_small_window():
+    """Strongly correlated AR(1) saturates a small ACF window."""
+    est = online_statistics(ar1(phi=0.9), max_lag=8)
+    assert acf_window_saturated(est)
+
+
+def test_acf_not_saturated_large_window():
+    """AR(1) phi=0.9 does NOT saturate a large window (tau ~ 19, max_lag=64 >> tau)."""
+    est = online_statistics(ar1(phi=0.9), max_lag=64)
+    assert not acf_window_saturated(est)
+
+
+def test_acf_not_saturated_iid():
+    """iid data is never saturated."""
+    est = online_statistics(ar1(phi=0.0), max_lag=32)
+    assert not acf_window_saturated(est)
+
+
+# --- tau_corr_reliable ---
+
+
+def test_tau_reliable_saturated_is_false():
+    """tau is not reliable when the window is saturated."""
+    est = online_statistics(ar1(phi=0.9), max_lag=8)
+    assert not tau_corr_reliable(est)
+
+
+def test_tau_reliable_iid_enough_data():
+    """iid data with plenty of samples yields a reliable tau."""
+    est = online_statistics(ar1(phi=0.0, n_samples=500), max_lag=32)
+    assert tau_corr_reliable(est)
+
+
+def test_tau_reliable_too_few_samples():
+    """Too few samples → n_eff/tau < 50 → not reliable."""
+    est = online_statistics(ar1(phi=0.0, n_samples=5), max_lag=4)
+    assert not tau_corr_reliable(est)
+
+
+# --- check_mc_convergence integration ---
+
+
+def test_check_mc_convergence_runs(vstate):
+    """check_mc_convergence returns (OnlineStats, HistoryDict) with finite stats."""
+    H = nk.operator.Ising(vstate.hilbert, nk.graph.Chain(4), h=1.0)
+    stats, hist = vstate.check_mc_convergence(H, max_chain_length=50)
+
+    assert math.isfinite(stats.mean)
+    assert math.isfinite(stats.variance)
+    assert "mean" in hist and "tau_corr_acf" in hist
+
+
+def test_check_mc_convergence_plot(vstate):
+    """plot=True runs without error and does not open a window."""
+    from unittest.mock import patch
+
+    H = nk.operator.Ising(vstate.hilbert, nk.graph.Chain(4), h=1.0)
+    with patch("matplotlib.pyplot.show"):
+        vstate.check_mc_convergence(H, max_chain_length=50, plot=True)
+
+
+# --- expect_to_precision ---
+
+
+def test_expect_to_precision_raises_no_tol(vstate):
+    """Must specify at least one of atol or rtol."""
+    H = nk.operator.Ising(vstate.hilbert, nk.graph.Chain(4), h=1.0)
+    with pytest.raises(ValueError, match="atol.*rtol"):
+        vstate.expect_to_precision(H, verbose=False)
+
+
+def test_expect_to_precision_raises_non_metropolis():
+    """Raises ValueError if sampler is not a MetropolisSampler."""
+    hi = nk.hilbert.Spin(1 / 2, N=4)
+    vs = nk.vqs.MCState(
+        nk.sampler.ExactSampler(hi),
+        nk.models.RBM(alpha=1),
+        n_samples=16,
+        seed=0,
+    )
+    H = nk.operator.Ising(hi, nk.graph.Chain(4), h=1.0)
+    with pytest.raises(ValueError, match="MetropolisSampler"):
+        vs.expect_to_precision(H, atol=0.5, verbose=False)
+
+
+def test_expect_to_precision_atol(vstate):
+    """Converges to atol and returns finite OnlineStatistics."""
+    H = nk.operator.Ising(vstate.hilbert, nk.graph.Chain(4), h=1.0)
+    stats = vstate.expect_to_precision(H, atol=0.5, max_iter=500, verbose=False)
+    s = stats.get_stats()
+    assert math.isfinite(s.mean)
+    assert s.error_of_mean <= 0.5
+
+
+def test_expect_to_precision_rtol(vstate):
+    """Converges to rtol and returns finite OnlineStatistics."""
+    H = nk.operator.Ising(vstate.hilbert, nk.graph.Chain(4), h=1.0)
+    stats = vstate.expect_to_precision(H, rtol=0.1, max_iter=500, verbose=False)
+    s = stats.get_stats()
+    assert math.isfinite(s.mean)
+    assert s.error_of_mean / abs(s.mean) <= 0.1
+
+
+def test_expect_to_precision_combined_tol(vstate):
+    """With both tolerances the criterion is err <= atol + rtol * |mean|.
+
+    An unachievable rtol must not prevent convergence: atol acts as an
+    absolute floor (NumPy convention), so this stops well before max_iter.
+    """
+    H = nk.operator.Ising(vstate.hilbert, nk.graph.Chain(4), h=1.0)
+    stats = vstate.expect_to_precision(
+        H, atol=0.5, rtol=1e-12, max_iter=500, verbose=False
+    )
+    s = stats.get_stats()
+    assert math.isfinite(s.mean)
+    assert s.error_of_mean <= 0.5 + 1e-12 * abs(s.mean)
+    # stopped on the atol floor instead of running to max_iter
+    assert stats.n_samples < 500 * vstate.n_samples
+
+
+def test_expect_to_precision_tol_pytree(vstate):
+    """Per-operator tolerances as pytrees matching the operator structure."""
+    hi = vstate.hilbert
+    H = nk.operator.Ising(hi, nk.graph.Chain(4), h=1.0)
+    M = sum(nk.operator.spin.sigmaz(hi, i) for i in range(hi.size))
+    ops = {"energy": H, "mag": M}
+    stats = vstate.expect_to_precision(
+        ops,
+        atol={"energy": None, "mag": 0.5},
+        rtol={"energy": 0.1, "mag": None},
+        max_iter=500,
+        verbose=False,
+    )
+    se = stats["energy"].get_stats()
+    sm = stats["mag"].get_stats()
+    assert se.error_of_mean <= 0.1 * abs(se.mean)
+    assert sm.error_of_mean <= 0.5
+
+
+def test_expect_to_precision_tol_scalar_broadcast(vstate):
+    """A scalar tolerance broadcasts over a pytree of operators."""
+    hi = vstate.hilbert
+    H = nk.operator.Ising(hi, nk.graph.Chain(4), h=1.0)
+    M = sum(nk.operator.spin.sigmaz(hi, i) for i in range(hi.size))
+    stats = vstate.expect_to_precision(
+        {"energy": H, "mag": M}, atol=0.5, max_iter=500, verbose=False
+    )
+    for s in stats.values():
+        assert s.get_stats().error_of_mean <= 0.5
+
+
+def test_expect_to_precision_tol_structure_mismatch(vstate):
+    """A tolerance pytree must match the operator structure."""
+    H = nk.operator.Ising(vstate.hilbert, nk.graph.Chain(4), h=1.0)
+    with pytest.raises(ValueError, match="matching the operator structure"):
+        vstate.expect_to_precision(
+            {"energy": H}, atol={"wrong_key": 0.5}, verbose=False
+        )
+
+
+def test_expect_to_precision_tol_missing_leaf(vstate):
+    """Every operator leaf must have at least one non-None tolerance."""
+    hi = vstate.hilbert
+    H = nk.operator.Ising(hi, nk.graph.Chain(4), h=1.0)
+    M = sum(nk.operator.spin.sigmaz(hi, i) for i in range(hi.size))
+    with pytest.raises(ValueError, match="atol.*rtol"):
+        vstate.expect_to_precision(
+            {"energy": H, "mag": M},
+            atol={"energy": 0.5, "mag": None},
+            verbose=False,
+        )
+
+
+def test_expect_to_precision_max_iter(vstate):
+    """Stops at max_iter without error when tolerance is unachievable."""
+    H = nk.operator.Ising(vstate.hilbert, nk.graph.Chain(4), h=1.0)
+    stats = vstate.expect_to_precision(H, atol=1e-10, max_iter=3, verbose=False)
+    s = stats.get_stats()
+    assert math.isfinite(s.mean)
+
+
+class BatchObservable:
+    def __init__(self, hilbert):
+        self.hilbert = hilbert
+
+
+@nk.vqs.local_estimators.dispatch
+def _(
+    vstate: nk.vqs.MCState, op: BatchObservable, chunk_size: int | None
+) -> LocalEstimatorsBatch:
+    samples = vstate.samples.reshape(vstate.sampler.n_chains, -1, vstate.hilbert.size)
+    x = samples[..., 0]
+    y = samples[..., 1]
+    data = jnp.stack([x, y], axis=-1)
+    return LocalEstimatorsBatch(
+        data=data,
+        combinator=lambda mu: jnp.outer(mu, mu),
+    )
+
+
+def test_expect_to_precision_verbose_batch(vstate):
+    """Array-valued observables should work with verbose progress formatting."""
+    obs = BatchObservable(vstate.hilbert)
+    stats = vstate.expect_to_precision(obs, atol=10.0, max_iter=2, verbose=True)
+    s = stats.get_stats()
+    assert s.mean.shape == (2, 2)
+    assert s.error_of_mean.shape == (2, 2)

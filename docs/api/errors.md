@@ -1,0 +1,71 @@
+(netket_errors_api)=
+# netket.errors
+
+```{eval-rst}
+.. currentmodule:: netket.errors
+
+```
+
+Netket has the following classes of errors.
+
+
+## Error classes
+
+```{eval-rst}
+.. autosummary::
+  :toctree: _generated/errors
+  :nosignatures:
+
+  HilbertIndexingDuringTracingError
+  HolomorphicUndeclaredWarning
+  InsufficientSamplesForSRWarning
+  JaxOperatorSetupDuringTracingError
+  JaxOperatorNotConvertibleToNumba
+  JaxOperatorGetConnInJitError
+  NonHolomorphicQGTOnTheFlyDenseRepresentationError
+  NumbaOperatorGetConnDuringTracingError
+  OperatorMultiplicationDeprecationWarning
+  RealQGTComplexDomainError
+  UnoptimalSRtWarning
+  SymmModuleInvalidInputShape
+  ParameterMismatchError
+  MCMixedStateExpectAndGradOnPhysicalOperatorError
+  InitializePeriodicLatticeOnSmallLatticeWarning
+  NNXModuleToSamplerInput
+```
+
+## Hilbert space errors
+
+Errors arising when working with Hilbert spaces and their constraints:
+
+```{eval-rst}
+.. autosummary::
+  :toctree: _generated/errors
+  :nosignatures:
+
+  UnoptimisedCustomConstraintRandomStateMethodWarning
+  UnhashableConstraintError
+  InvalidConstraintInterface
+```
+
+## PyTree errors
+
+```{eval-rst}
+.. autosummary::
+  :toctree: _generated/errors
+  :nosignatures:
+
+  NetKetPyTreeUndeclaredAttributeAssignmentError
+```
+
+## Driver update warnings
+
+```{eval-rst}
+.. autosummary::
+  :toctree: _generated/errors
+  :nosignatures:
+
+  LogAdditionalDataSignatureDeprecationWarning
+  DriverResetDeprecationWarning
+  ForwardAndBackwardDeprecationWarning
+```

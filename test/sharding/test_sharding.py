@@ -1,0 +1,621 @@
+import pytest
+
+import jax
+from jax.sharding import NamedSharding, SingleDeviceSharding, PartitionSpec as P
+from flax import serialization
+
+import numpy as np
+import netket as nk
+import netket.experimental as nkx
+
+from ..common import onlyif_sharding_single_process
+
+
+def _setup(L, alpha=1, reset_chains=False):
+    g = nk.graph.Hypercube(length=L, n_dim=1, pbc=True)
+    hi = nk.hilbert.Spin(s=1 / 2, N=g.n_nodes)
+    ma = nk.models.RBM(alpha=alpha, param_dtype=np.complex128)
+    sa = nk.sampler.MetropolisLocal(
+        hi, n_chains=16 * jax.device_count(), dtype=np.int8, reset_chains=reset_chains
+    )
+    vs = nk.vqs.MCState(sa, ma, n_samples=1024, n_discard_per_chain=8)
+    ha = nk.operator.IsingJax(hilbert=vs.hilbert, graph=g, h=1.0)
+    return vs, g, ha
+
+
+def _check_correct_sharding(x, replicated=False):
+    if isinstance(x.sharding, jax.sharding.NamedSharding):
+        mesh = x.sharding.mesh
+    else:
+        mesh = jax.sharding.get_abstract_mesh()
+    if jax.device_count() > 1:
+        if replicated:
+            s = NamedSharding(mesh, P())
+        else:
+            s = NamedSharding(mesh, P("S"))
+    else:
+        s = SingleDeviceSharding(jax.devices()[0])
+    assert x.sharding.is_equivalent_to(s, x.ndim)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_sampling():
+    vs, *_ = _setup(16)
+    n_chains = 16 * jax.device_count()
+    n_samples = 1024
+
+    # check sampler state has correct sharding
+    x = vs.sampler_state.σ
+    assert x.shape == (n_chains, vs.hilbert.size)
+    _check_correct_sharding(x)
+
+    # check samples have correct sharding
+    samples = vs.sample()
+    assert samples.shape == (n_chains, n_samples // n_chains, vs.hilbert.size)
+    _check_correct_sharding(samples)
+
+    # check sampler state still has correct sharding after having sampled
+    x = vs.sampler_state.σ
+    assert x.shape == (n_chains, vs.hilbert.size)
+    _check_correct_sharding(x)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_pt():
+    vs, _, ha = _setup(8)
+    hi = ha.hilbert
+
+    sa = nk.sampler.ParallelTemperingSampler(
+        hi,
+        rule=nk.sampler.rules.HamiltonianRule(ha),
+        n_replicas=4,
+        sweep_size=hi.size * 4,
+    )
+    vs.sampler = sa
+
+    samples = vs.sample(chain_length=10)
+
+    assert samples.shape == (sa.n_batches // sa.n_replicas, 10, hi.size)
+    sharding = NamedSharding(samples.sharding.mesh, P("S"))
+    assert samples.sharding.is_equivalent_to(sharding, 3)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_project_preserves_sharding():
+    """Regression test: Representation.project() must preserve sample sharding.
+
+    Previously, apply_operator dropped the P('S',) sharding of σ when
+    initialising the projected MCState's sampler state, causing
+    vstate2.samples.sharding to be P() (replicated) instead of P('S',).
+    """
+    vs, g, _ = _setup(8)
+    graph = g
+
+    rep = nk.symmetry.canonical_representation(vs.hilbert, graph.translation_group())
+    vs2 = rep.project(state=vs, character_index=0)
+
+    # sampler_state.σ must be sharded along the chain axis
+    _check_correct_sharding(vs2.sampler_state.σ)
+
+    # samples produced by the projected state must also be sharded
+    samples = vs2.samples
+    _check_correct_sharding(samples)
+
+
+@onlyif_sharding_single_process
+def test_sampling_warns_if_sampler_state_sigma_is_replicated():
+    vs, *_ = _setup(8)
+
+    # Simulate a buggy transformation that preserves the shape of sigma but drops
+    # its sharding metadata.
+    broken_sigma = nk.jax.sharding.gather(vs.sampler_state.σ)
+    vs.sampler_state = vs.sampler_state.replace(σ=broken_sigma)
+
+    with pytest.warns(UserWarning) as record:
+        vs.sample(chain_length=1)
+
+    assert any("state.σ" in str(w.message) for w in record)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_expect():
+    vs, _, ha = _setup(16)
+    E = vs.expect(ha)
+    # check printing works
+    str(E)
+    for l in jax.tree_util.tree_leaves(E):
+        _check_correct_sharding(l, replicated=True)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_grad():
+    vs, g, ha = _setup(16)
+    E, G = vs.expect_and_grad(ha)
+    # check printing works
+    str(E)
+    for l in jax.tree_util.tree_leaves(E):
+        _check_correct_sharding(l, replicated=True)
+
+    for l in jax.tree_util.tree_leaves(G):
+        _check_correct_sharding(l, replicated=True)
+
+
+@pytest.mark.parametrize(
+    "Op",
+    [pytest.param(nk.operator.IsingJax, id="IsingJax")],
+)
+@pytest.mark.parametrize(
+    "qgt",
+    [
+        pytest.param(nk.optimizer.qgt.QGTJacobianPyTree, id="pytree"),
+        pytest.param(nk.optimizer.qgt.QGTJacobianDense, id="dense"),
+        pytest.param(nk.optimizer.qgt.QGTOnTheFly, id="onthefly"),
+    ],
+)
+@pytest.mark.parametrize(
+    "chunk_size",
+    [None, 64],
+)
+@pytest.mark.parametrize(
+    "reset_chains",
+    [False, True],
+)
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_vmc(Op, qgt, chunk_size, reset_chains):
+    vs, g, _ = _setup(16, reset_chains=reset_chains)
+    vs.chunk_size = chunk_size
+    # initially the params are only on the first device of each process
+    # but they will be broadcast on the first invocation, so here we only check its fully addressable
+    for l in jax.tree_util.tree_leaves(vs.variables):
+        assert l.is_fully_replicated
+
+    ha = Op(hilbert=vs.hilbert, graph=g, h=1.0)
+    opt = nk.optimizer.Sgd(learning_rate=0.05)
+    sr = nk.optimizer.SR(qgt(holomorphic=True), diag_shift=0.01)
+    gs = nk.driver.VMC(ha, opt, variational_state=vs, preconditioner=sr)
+    gs.run(5)
+
+    for l in jax.tree_util.tree_leaves(vs.variables):
+        _check_correct_sharding(l, replicated=True)
+
+
+@pytest.mark.parametrize(
+    "qgt",
+    [
+        pytest.param(nk.optimizer.qgt.QGTJacobianPyTree, id="pytree"),
+        pytest.param(nk.optimizer.qgt.QGTJacobianDense, id="dense"),
+    ],
+)
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_qgt_jacobian(qgt):
+    n_samples = 1024
+    vs, *_ = _setup(16)
+    S = vs.quantum_geometric_tensor(qgt(holomorphic=True))
+    for l in jax.tree_util.tree_leaves(S.O):
+        assert l.shape[0] == n_samples
+        _check_correct_sharding(l)
+
+    v = vs.parameters
+    res = S @ v
+
+    for l in jax.tree_util.tree_leaves(res):
+        _check_correct_sharding(l, replicated=True)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_qgt_onthefly():
+    vs, *_ = _setup(16)
+    S = vs.quantum_geometric_tensor(nk.optimizer.qgt.QGTOnTheFly(holomorphic=True))
+    # TODO maybe check S._mat_vec tree leaves
+    v = vs.parameters
+    res = S @ v
+
+    for l in jax.tree_util.tree_leaves(res):
+        _check_correct_sharding(l, replicated=True)
+
+
+@onlyif_sharding_single_process
+def test_qgt_onthefly_chunked_matches_unchunked():
+    """Regression test: QGTOnTheFly chunked result must be device-count independent.
+
+    Previously a missing ``pvary_args_tree`` on the internal ``_O_vjp``
+    caused jax.vjp inside shard_map to implicitly psum the gradient wrt
+    the replicated ``params``/``model_state`` inputs, compounding with
+    the explicit ``reduction_op_tree=jax.lax.psum`` and producing a
+    result ``n_devices``-times too large (silently — no error).
+
+    We use FullSumState because its samples are all basis states (deterministic),
+    so the QGT is numerically identical given the same parameters regardless of
+    how many devices hold the shards, making a 1-device vs N-device comparison exact.
+    """
+    L = 4  # 2^4 = 16 basis states
+    g = nk.graph.Hypercube(length=L, n_dim=1, pbc=True)
+    hi = nk.hilbert.Spin(s=1 / 2, N=g.n_nodes)
+    ma = nk.models.RBM(alpha=1, param_dtype=np.complex128)
+
+    full_mesh = jax.sharding.get_mesh()
+    single_mesh = jax.make_mesh((1,), ("S",), axis_types=full_mesh.axis_types[0])
+
+    n_states_per_shard = hi.n_states // jax.device_count()
+    chunk_size = max(n_states_per_shard // 2, 1)
+
+    # Shared parameters as plain numpy — no device affiliation
+    params_np = jax.tree.map(np.asarray, nk.vqs.FullSumState(hi, ma).parameters)
+
+    # Reference: single-device mesh — shard_map runs on 1 device, no psum scaling possible
+    jax.sharding.set_mesh(single_mesh)
+    try:
+        vs_ref = nk.vqs.FullSumState(hi, ma)
+        vs_ref.parameters = jax.device_put(params_np, NamedSharding(single_mesh, P()))
+        S_ref = nk.optimizer.qgt.QGTOnTheFly(
+            vs_ref, chunk_size=chunk_size, holomorphic=True
+        )
+        res_ref = jax.tree.map(np.asarray, S_ref @ vs_ref.parameters)
+    finally:
+        jax.sharding.set_mesh(full_mesh)
+
+    # Test: full mesh
+    vs = nk.vqs.FullSumState(hi, ma)
+    vs.parameters = jax.device_put(params_np, NamedSharding(full_mesh, P()))
+    S = nk.optimizer.qgt.QGTOnTheFly(vs, chunk_size=chunk_size, holomorphic=True)
+    res = S @ vs.parameters
+
+    jax.tree.map(
+        lambda r_ref, r: np.testing.assert_allclose(r, r_ref, rtol=1e-10, atol=1e-10),
+        res_ref,
+        res,
+    )
+
+
+@pytest.mark.parametrize(
+    "Op",
+    [pytest.param(nk.operator.IsingJax, id="IsingJax")],
+)
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_operators(Op):
+    vs, g, *_ = _setup(16)
+    ha = Op(hilbert=vs.hilbert, graph=g, h=1.0)
+    x = jax.jit(jax.lax.collapse, static_argnums=(1, 2))(vs.samples, 0, 2)
+
+    _check_correct_sharding(x)
+    xp, mels = ha.get_conn_padded(x)
+
+    n_conn = xp.shape[1]
+    assert xp.shape == (x.shape[0], n_conn, x.shape[-1])
+    assert mels.shape == (x.shape[0], n_conn)
+
+    _check_correct_sharding(xp)
+    _check_correct_sharding(mels)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+@pytest.mark.parametrize(
+    "chunk_size",
+    [None, 64],
+)
+def test_fullsumstate(chunk_size):
+    L = 12
+    g = nk.graph.Hypercube(length=L, n_dim=1, pbc=True)
+    hi = nk.hilbert.Spin(s=1 / 2, N=g.n_nodes)
+    ma = nk.models.RBM(alpha=1, param_dtype=np.complex128)
+    vs = nk.vqs.FullSumState(hi, ma, chunk_size=chunk_size)
+    ha = nk.operator.IsingJax(hilbert=vs.hilbert, graph=g, h=1.0)
+    opt = nk.optimizer.Sgd(learning_rate=0.05)
+    sr = nk.optimizer.SR(
+        nk.optimizer.qgt.QGTOnTheFly(holomorphic=True), diag_shift=0.01
+    )
+    gs = nk.driver.VMC(ha, opt, variational_state=vs, preconditioner=sr)
+    gs.run(5)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+@pytest.mark.parametrize(
+    "chunk_size",
+    [None, 64],
+)
+def test_exactsampler(chunk_size):
+    L = 12
+    g = nk.graph.Hypercube(length=L, n_dim=1, pbc=True)
+    hi = nk.hilbert.Spin(s=1 / 2, N=g.n_nodes)
+    ma = nk.models.RBM(alpha=1, param_dtype=np.complex128)
+    sa = nk.sampler.ExactSampler(hi, dtype=np.int8)
+    vs = nk.vqs.MCState(sa, ma, n_samples=1024, chunk_size=chunk_size)
+
+    pos_sharding = NamedSharding(vs.samples.sharding.mesh, P("S"))
+    assert vs.samples.sharding.is_equivalent_to(pos_sharding, ndim=3)
+
+    ha = nk.operator.IsingJax(hilbert=vs.hilbert, graph=g, h=1.0)
+    opt = nk.optimizer.Sgd(learning_rate=0.05)
+    sr = nk.optimizer.SR(
+        nk.optimizer.qgt.QGTOnTheFly(holomorphic=True), diag_shift=0.01
+    )
+    gs = nk.driver.VMC(ha, opt, variational_state=vs, preconditioner=sr)
+    gs.run(5)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+@pytest.mark.filterwarnings("ignore::netket.errors.InsufficientSamplesForSRWarning")
+def test_autoreg():
+    L = 32
+    g = nk.graph.Hypercube(length=L, n_dim=1, pbc=True)
+    hi = nk.hilbert.Spin(s=1 / 2, N=g.n_nodes)
+    ha = nk.operator.IsingJax(hilbert=hi, graph=g, h=1)
+    ma = nk.models.FastARNNConv1D(hilbert=hi, layers=3, features=16, kernel_size=3)
+    sa = nk.sampler.ARDirectSampler(hi)
+    opt = nk.optimizer.Sgd(learning_rate=0.1)
+    sr = nk.optimizer.SR(diag_shift=0.01)
+    vs = nk.vqs.MCState(sa, ma, n_samples=256)
+    pos_sharding = NamedSharding(vs.samples.sharding.mesh, P("S"))
+    assert vs.samples.sharding.is_equivalent_to(pos_sharding, 3)
+    gs = nk.driver.VMC(ha, opt, variational_state=vs, preconditioner=sr)
+    gs.run(n_iter=5)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+@pytest.mark.parametrize(
+    "logger",
+    [
+        pytest.param(
+            (
+                lambda _: nk.logging.RuntimeLog(),
+                lambda logger: logger.serialize("_test_runtimelog.json"),
+            ),
+            id="RuntimeLog",
+        ),
+        pytest.param(
+            (
+                lambda path: nk.logging.JsonLog(
+                    path, save_params_every=1, write_every=1
+                ),
+                lambda logger: None,
+            ),
+            id="JsonLog",
+        ),
+        pytest.param(
+            (lambda path: nk.logging.StateLog(path, save_every=1), lambda logger: None),
+            id="StateLog",
+        ),
+        pytest.param(
+            (
+                lambda path: nk.logging.HDF5Log(
+                    path, save_params=True, save_params_every=1
+                ),
+                lambda logger: None,
+            ),
+            id="HDF5Log",
+        ),
+    ],
+)
+def test_loggers(tmp_path, logger):
+    vs, _, ha = _setup(12)
+    logger, out_fun = logger
+    logger = logger(str(tmp_path))
+    opt = nk.optimizer.Sgd(learning_rate=0.05)
+    gs = nk.driver.VMC(ha, opt, variational_state=vs)
+    gs.run(10, out=logger)
+    out_fun(logger)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_serialization():
+    vs, _, ha = _setup(12)
+
+    b = serialization.to_bytes(vs)
+    vs = serialization.from_bytes(vs, b)
+
+    opt = nk.optimizer.Sgd(learning_rate=0.05)
+    gs = nk.driver.VMC(ha, opt, variational_state=vs)
+    gs.run(1)
+
+    b = serialization.to_bytes(gs.state)
+    vs2 = serialization.from_bytes(gs.state, b)
+    gs2 = nk.driver.VMC(ha, opt, variational_state=vs2)
+    gs2.run(1)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_timeevolution():
+    L = 8
+    vs, _, ha = _setup(L)
+    Sx = sum([nk.operator.spin.sigmax(ha.hilbert, i) for i in range(L)])
+    Sx = Sx.to_pauli_strings().to_jax_operator()
+    ode_solver = nkx.dynamics.Euler(dt=0.001)
+    te = nkx.TDVP(
+        ha,
+        variational_state=vs,
+        ode_solver=ode_solver,
+        t0=0.0,
+        qgt=nk.optimizer.qgt.QGTOnTheFly(holomorphic=True, diag_shift=1e-4),
+        error_norm="qgt",
+    )
+    te.run(T=0.005, obs={"Sx": Sx}, show_progress=True)
+    te2 = nkx.driver.TDVPSchmitt(
+        ha,
+        variational_state=vs,
+        ode_solver=ode_solver,
+        t0=0.0,
+        error_norm="qgt",
+        holomorphic=True,
+    )
+    te2.run(T=0.005, obs={"Sx": Sx}, show_progress=True)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_sr():
+    vs, _, ha = _setup(12, alpha=2)
+    vs.n_samples = 64
+    opt = nk.optimizer.Sgd(learning_rate=0.05)
+    gs = nk.driver.VMC_SR(
+        ha,
+        opt,
+        variational_state=vs,
+        diag_shift=0.1,
+        mode="complex",
+    )
+    gs.run(2)
+
+
+@onlyif_sharding_single_process
+def test_jacobian_chunked():
+    vs, _, ha = _setup(12, alpha=2)
+    vs.n_samples = 64
+    x = jax.lax.collapse(vs.samples, 0, 2)
+
+    kwargs = {"mode": "holomorphic", "dense": False, "center": False}
+
+    j_repl = nk.jax.jacobian(
+        vs._apply_fun,
+        vs.parameters,
+        np.array(x),
+        {},
+        **kwargs,
+        chunk_size=None,
+        _axis_0_is_sharded=False,
+    )  # jacobian is centered
+
+    j = nk.jax.jacobian(
+        vs._apply_fun,
+        vs.parameters,
+        x,
+        {},
+        **kwargs,
+        chunk_size=None,
+        _axis_0_is_sharded=True,
+    )  # jacobian is centered
+
+    jc = nk.jax.jacobian(
+        vs._apply_fun,
+        vs.parameters,
+        x,
+        {},
+        **kwargs,
+        chunk_size=8,
+        _axis_0_is_sharded=True,
+    )  # jacobian is centered
+
+    jax.tree.map(np.testing.assert_allclose, j_repl, j)
+    jax.tree.map(np.testing.assert_allclose, j, jc)
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_srt_onthefly_applyop():
+    """
+    Minimal working example to reproduce sharding crash.
+    """
+    hi = nk.hilbert.Spin(s=1 / 2, N=4)
+    ma = nk.models.RBM(alpha=1)
+    sampler = nk.sampler.MetropolisLocal(hi)
+    vs = nk.vqs.MCState(
+        sampler,
+        ma,
+        n_samples=64,
+    )
+
+    # Applying identity causes a crash; PauliStrings identity does not
+    op = nk.operator.spin.identity(hilbert=hi)
+    vs = nk.vqs.apply_operator(op, vs)
+
+    H = -sum(nk.operator.spin.sigmax(hilbert=hi, site=i) for i in range(hi.size))
+    driver = nk.driver.VMC_SR(
+        hamiltonian=H,
+        diag_shift=1e-3,
+        variational_state=vs,
+        optimizer=nk.optimizer.Sgd(learning_rate=0.05),
+        use_ntk=True,
+        on_the_fly=True,
+    )
+    driver.run(n_iter=5)
+    print("Done — no crash.")
+
+
+@pytest.mark.skipif(
+    not nk.config.netket_experimental_sharding, reason="Only run with sharding"
+)
+def test_apply_operator_chunked_pnc_mwe():
+    """
+    Minimal working example for the chunked sharding crash in apply_operator
+    with particle-number-and-spin-conserving fermionic operators.
+
+    TODO: Re-check on future JAX releases whether this regression test is still
+    needed, once the `jnp.full_like` sharded chunking issue is fixed upstream.
+    """
+    L = 2
+    D = 2
+    t = 1.0
+    U = 0.01
+
+    graph = nk.graph.Hypercube(length=L, n_dim=D, pbc=True)
+    hilbert = nk.hilbert.SpinOrbitalFermions(
+        graph.n_nodes, s=1 / 2, n_fermions_per_spin=(2, 2)
+    )
+
+    def c(site, sz):
+        return nk.operator.fermion.destroy(hilbert, site, sz=sz)
+
+    def cdag(site, sz):
+        return nk.operator.fermion.create(hilbert, site, sz=sz)
+
+    def nc(site, sz):
+        return nk.operator.fermion.number(hilbert, site, sz=sz)
+
+    ham = 0.0
+    for sz in (+1, -1):
+        for u, v in graph.edges():
+            ham += -t * cdag(u, sz) @ c(v, sz) - t * cdag(v, sz) @ c(u, sz)
+    for u in graph.nodes():
+        ham += U * nc(u, +1) @ nc(u, -1)
+
+    ham = nkx.operator.ParticleNumberAndSpinConservingFermioperator2nd.from_fermionoperator2nd(
+        ham
+    )
+
+    sampler = nk.sampler.MetropolisFermionHop(
+        hilbert, graph=graph, n_chains=16, sweep_size=64, spin_symmetric=True
+    )
+    model = nk.models.Slater2nd(hilbert)
+    vstate = nk.vqs.MCState(
+        sampler, model, n_samples=64, n_discard_per_chain=1, chunk_size=64
+    )
+
+    op = nk.operator.fermion.identity(hilbert) + 0.1 * ham
+    transformed_vstate = nk.vqs.apply_operator(op, vstate, seed=1)
+    stats = transformed_vstate.expect(ham)
+
+    assert transformed_vstate.chunk_size == max(
+        vstate.chunk_size // op.max_conn_size, 1
+    )
+    assert np.isfinite(stats.mean.real)

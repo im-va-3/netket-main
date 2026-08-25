@@ -1,0 +1,274 @@
+# Copyright 2021 The NetKet Authors - All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import flax
+from jax import numpy as jnp
+
+from .. import common
+
+import numpy as np
+import pytest
+import jax
+from jax.nn.initializers import normal
+
+import netket as nk
+from netket.experimental.hilbert import Particle
+
+
+np.random.seed(1234)
+
+WEIGHT_SEED = 1234
+SAMPLER_SEED = 15324
+
+
+# Initializations raising errors
+@common.skipif_mpi
+def test_wrong_initialization():
+    g = nk.graph.Hypercube(length=4, n_dim=1)
+    hi = nk.hilbert.Spin(s=0.5, N=g.n_nodes)
+    hib_u = nk.hilbert.Fock(n_max=3, N=g.n_nodes)
+
+    for n_replicas in [-3, 0, 5, 2.1]:
+        with pytest.raises(
+            ValueError,
+        ):
+            sa = nk.sampler.ParallelTemperingLocal(
+                hi,
+                n_replicas=n_replicas,
+                sweep_size=hib_u.size * 4,
+            )
+
+    with pytest.raises(ValueError):
+        sa = nk.sampler.ParallelTemperingLocal(
+            hi,
+            betas="custom",
+            sweep_size=hib_u.size * 4,
+        )
+
+    for betas in [[1.1, 0.5], [-1.0, 0.2], [0.0, 1.0]]:
+        with pytest.raises(ValueError):
+            sa = nk.sampler.ParallelTemperingLocal(
+                hi,
+                betas=betas,
+                sweep_size=hib_u.size * 4,
+            )
+
+    sa = nk.sampler.ParallelTemperingLocal(
+        hi,
+        sweep_size=hib_u.size * 4,
+    )
+    assert (sa.sorted_betas == 1 - np.arange(32) / 32).all()
+
+
+# Verify the possibility to initialize in multiple ways
+@pytest.mark.parametrize("n_replicas", [None, 32])
+@pytest.mark.parametrize("betas", ["linear", "logarithmic"])
+def test_initialization_beta_distribution(model_and_weights, n_replicas, betas):
+    g = nk.graph.Hypercube(length=4, n_dim=1)
+    hi = nk.hilbert.Spin(s=0.5, N=g.n_nodes)
+    hib_u = nk.hilbert.Fock(n_max=3, N=g.n_nodes)
+
+    sa = nk.sampler.ParallelTemperingLocal(
+        hi,
+        n_replicas=n_replicas,
+        betas=betas,
+        sweep_size=hib_u.size * 4,
+    )
+    assert sa.n_replicas == 32
+    assert sa.sorted_betas.shape == (32,)
+    assert sa.sorted_betas[0] == 1 and sa.sorted_betas[-1] > 0
+
+    ma, w = model_and_weights(hi, sa)
+
+    sampler_state = sa.init_state(ma, w, seed=SAMPLER_SEED)
+    assert sampler_state.beta.shape == (sa.n_batches // sa.n_replicas, sa.n_replicas)
+
+
+betas_list = [
+    pytest.param(1 - (np.arange(32) / 32) ** 3, id="cubic"),
+    pytest.param(np.linspace(0.1, 1, 32)[::-1], id="shuffled"),
+]
+
+
+# Verify the possibility to initialize in multiple ways
+@pytest.mark.parametrize("betas", betas_list)
+def test_initialization_beta_list(model_and_weights, betas):
+    g = nk.graph.Hypercube(length=4, n_dim=1)
+    hi = nk.hilbert.Spin(s=0.5, N=g.n_nodes)
+    hib_u = nk.hilbert.Fock(n_max=3, N=g.n_nodes)
+
+    sa = nk.sampler.ParallelTemperingLocal(
+        hi,
+        betas=betas,
+        sweep_size=hib_u.size * 4,
+    )
+    assert sa.n_replicas == 32
+    assert sa.sorted_betas.shape == (32,)
+    assert sa.sorted_betas[0] == 1 and sa.sorted_betas[-1] > 0
+
+    ma, w = model_and_weights(hi, sa)
+
+    sampler_state = sa.init_state(ma, w, seed=SAMPLER_SEED)
+    assert sampler_state.beta.shape == (sa.n_batches // sa.n_replicas, sa.n_replicas)
+
+
+# This test verifies that the acceptance is indeed a float
+# and that its value is 1 for a state with flat distribution
+# It also verifies that the statistics of the temperatures are normalized
+def test_sampler_statistics():
+    g = nk.graph.Hypercube(length=4, n_dim=1)
+    hi = nk.hilbert.Spin(s=0.5, N=g.n_nodes)
+
+    ma = nk.models.Jastrow(
+        kernel_init=flax.linen.initializers.constant(0.0)
+    )  # |psi> = |+>
+
+    sa = nk.sampler.ParallelTemperingLocal(
+        hi,
+        n_replicas=4,
+        sweep_size=hi.size * 4,
+    )
+    vs = nk.vqs.MCState(sa, ma, n_samples=1000, seed=WEIGHT_SEED)
+    vs.sample()
+
+    assert jnp.isclose(vs.sampler_state.acceptance, 1.0)
+
+    # check the statistics of beta=1
+    assert jnp.abs(vs.sampler_state.normalized_position) <= 1.0
+    assert vs.sampler_state.normalized_diffusion <= 1.0
+
+
+# The following fixture initialises a model and it's weights
+# for tests that require it.
+@pytest.fixture
+def model_and_weights(request):
+    def build_model(hilb, sampler=None):
+        if isinstance(sampler, nk.sampler.ARDirectSampler):
+            ma = nk.models.ARNNDense(
+                hilbert=hilb, machine_pow=sampler.machine_pow, layers=3, features=5
+            )
+        elif isinstance(hilb, Particle):
+            ma = nk.models.Gaussian()
+        else:
+            # Build RBM by default
+            ma = nk.models.RBM(
+                alpha=1,
+                param_dtype=complex,
+                kernel_init=normal(stddev=0.1),
+                hidden_bias_init=normal(stddev=0.1),
+            )
+
+        # init network
+        w = ma.init(jax.random.PRNGKey(WEIGHT_SEED), jnp.zeros((1, hilb.size)))
+
+        return ma, w
+
+    # Do something with the data
+    return build_model
+
+
+def test_multiplerules_pt(model_and_weights):
+    # this test is important especially when we have multiple devices
+    g = nk.graph.Hypercube(length=4, n_dim=1)
+    hi = nk.hilbert.Spin(s=0.5, N=g.n_nodes)
+    ha = nk.operator.Ising(hilbert=hi, graph=g, h=1.0)
+    hib_u = nk.hilbert.Fock(n_max=3, N=g.n_nodes)
+
+    sa = nk.sampler.ParallelTemperingSampler(
+        hi,
+        rule=nk.sampler.rules.MultipleRules(
+            [nk.sampler.rules.LocalRule(), nk.sampler.rules.HamiltonianRule(ha)],
+            [0.8, 0.2],
+        ),
+        n_replicas=4,
+        sweep_size=hib_u.size * 4,
+    )
+
+    ma, w = model_and_weights(hi, sa)
+
+    sampler_state = sa.init_state(ma, w, seed=SAMPLER_SEED)
+    sampler_state = sa.reset(ma, w, state=sampler_state)
+    samples, sampler_state = sa.sample(
+        ma,
+        w,
+        state=sampler_state,
+        chain_length=10,
+    )
+    assert samples.shape == (sa.n_batches // sa.n_replicas, 10, hi.size)
+
+
+@common.skipif_distributed
+def test_asymmetric_rule_correct_marginal():
+    """Regression test for issue #2250.
+
+    With an asymmetric transition rule (here ``HamiltonianRule``) the proposal
+    correction ``log_prob_correction`` must NOT be scaled by the inverse
+    temperature beta. If it is (the old, buggy behaviour), the beta < 1 replicas
+    sample the wrong tempered distribution and, through replica exchange, bias
+    the beta=1 marginal away from the target ``|psi|^machine_pow``.
+
+    We build a small, exactly-enumerable and genuinely *peaked* target
+    distribution by hand (via ``LogStateVector``) and check that the empirical
+    distribution of the beta=1 replica matches it in total-variation distance.
+    A nearly-flat target (as produced by an RBM with tiny weights) would hide
+    the bug, so we deliberately use a peaked, structured one.
+
+    With the fix TV ~0.003 (stable across seeds); with the bug TV ~0.032.
+    """
+    g = nk.graph.Chain(length=6, pbc=True)
+    hi = nk.hilbert.Spin(s=0.5, N=g.n_nodes, total_sz=0.0)
+    ha = nk.operator.Heisenberg(hilbert=hi, graph=g)
+
+    # Manually construct a deterministic, peaked target distribution from a
+    # classical Ising energy E(sigma) = - sum_<ij> sigma_i sigma_j on the ring.
+    # This gives a structured distribution (TV from uniform ~0.54, max/min
+    # prob ~120) whose shape is fully reproducible, independent of any random
+    # network initialisation.
+    all_states = hi.all_states()  # (n_states, N), values +/-1
+    edges = np.asarray(g.edges())
+    E = -np.sum(all_states[:, edges[:, 0]] * all_states[:, edges[:, 1]], axis=1)
+    K = 0.6  # inverse-temperature-like knob controlling the peakedness
+    log_weight = -K * E  # unnormalised log p(sigma)
+
+    # LogStateVector stores log psi(sigma); with machine_pow=2 the sampler
+    # targets |psi|^2 = exp(2 Re log psi), so set log psi = 0.5 * log_weight.
+    ma = nk.models.LogStateVector(hi, param_dtype=float)
+    w = {"params": {"logstate": jnp.asarray(0.5 * log_weight)}}
+
+    # exact target distribution p(sigma) = |psi(sigma)|^2 / Z
+    ps = np.exp(log_weight)
+    ps /= ps.sum()
+
+    sa = nk.sampler.ParallelTemperingSampler(
+        hi,
+        rule=nk.sampler.rules.HamiltonianRule(ha),
+        n_replicas=8,
+        n_chains=32,
+        sweep_size=hi.size,
+    )
+
+    sampler_state = sa.init_state(ma, w, seed=SAMPLER_SEED)
+    sampler_state = sa.reset(ma, w, state=sampler_state)
+    # burn-in
+    _, sampler_state = sa.sample(ma, w, state=sampler_state, chain_length=500)
+    samples, sampler_state = sa.sample(ma, w, state=sampler_state, chain_length=8000)
+
+    sttn = hi.states_to_numbers(np.asarray(samples.reshape(-1, hi.size)))
+    unique, counts = np.unique(sttn, return_counts=True)
+    hist = np.zeros(hi.n_states)
+    hist[unique] = counts
+    emp = hist / hist.sum()
+
+    tv = 0.5 * np.sum(np.abs(emp - ps))
+    assert tv < 0.01, f"beta=1 marginal is biased (total-variation distance {tv:.4f})"

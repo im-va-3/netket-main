@@ -1,0 +1,174 @@
+# Experimental API
+
+```{eval-rst}
+.. currentmodule:: netket.experimental
+```
+
+In this page we present some experimental interfaces of NetKet.
+Those are not guaranteed to be API-stable, and might change without notice (other than the
+changelog) among minor releases.
+The [netket.experimental](api-experimental) module mirrors the standard {ref}`netket <netket_api>` module structure,
+and we suggest to use it as follows:
+
+```python
+import netket as nk
+import netket.experimental as nkx
+```
+
+(experimental-drivers-api)=
+## Drivers
+
+The infidelity driver {class}`netket.driver.Infidelity_SR` was stabilized in NetKet 3.22 and is now available directly in {mod}`netket.driver`. Please use {class}`netket.driver.Infidelity_SR` instead of `netket.experimental.driver.Infidelity_SR`.
+
+
+(experimental-qsr-api)=
+## Quantum State Reconstruction
+The Quantum State Reconstruction algorithm performs an approximate tomographic reconstruction of measurement data coming from a quantum computer (or similar device) using a Pure or Mixed quantum state.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated/experimental/qsr
+   :template: class
+   :nosignatures:
+
+   QSR
+```
+
+(experimental-sampler-api)=
+## Samplers
+
+They are experimental, meaning that we could change them at some point, and we actively seeking for feedback and opinions on their usage and APIs.
+
+```{eval-rst}
+.. currentmodule:: netket.experimental
+
+```
+
+(experimental-fermions-api)=
+## Fermions and PyScf
+
+This modules contains operators for particle-number conserving fermionic operators as well as utility functions that are used to create hamiltonians directly from PyScf molecules.
+
+Previously we also had the remaining Fermionic functionality in the experimental namespace, but in May 2024 it was stabilised and moved to the main netket namespace. In particular, use {class}`netket.operator.FermiHubbardJax` from {mod}`netket.operator`.
+
+```{eval-rst}
+.. currentmodule:: netket.experimental
+```
+
+```{eval-rst}
+.. autosummary::
+    :toctree: _generated/operator
+    :template: class
+    :nosignatures:
+
+    operator.ParticleNumberConservingFermioperator2nd
+    operator.ParticleNumberAndSpinConservingFermioperator2nd
+
+    operator.from_pyscf_molecule
+    operator.pyscf.TV_from_pyscf_molecule
+```
+
+(experimental-logging-api)=
+## Logging
+
+There are currently no experimental loggers documented in `netket.experimental.logging`.
+
+(netket_geometry_api)=
+## Geometry
+
+```{eval-rst}
+.. currentmodule:: netket.experimental
+```
+
+The :mod:`netket.experimental.geometry` module contains helper classes to describe the geometry of continuous spaces.
+These objects can be passed to {class}`~netket.experimental.hilbert.Particle` and provide utilities such as distance computations.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated/geometry
+   :template: class
+   :nosignatures:
+
+   geometry.Cell
+   geometry.FreeSpace
+```
+
+
+(experimental-variational-api)=
+## Variational State Interface
+
+```{eval-rst}
+.. currentmodule:: netket.experimental
+```
+
+```{eval-rst}
+.. autosummary::
+  :toctree: _generated/experimental/variational
+  :nosignatures:
+
+  vqs.variables_from_file
+  vqs.variables_from_tar
+
+```
+
+## Time Evolution Driver
+
+
+```{eval-rst}
+.. currentmodule:: netket.experimental
+```
+
+```{eval-rst}
+.. autosummary::
+  :toctree: _generated/experimental/dynamics
+  :nosignatures:
+
+  TDVP
+  driver.TDVPSchmitt
+```
+
+## ODE Integrators
+
+### Concrete solvers
+This is a collection of ODE solvers that can be used with the TDVP driver above.
+
+```{eval-rst}
+.. currentmodule:: netket.experimental
+```
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated/experimental/dynamics
+   :nosignatures:
+
+   dynamics.Euler
+   dynamics.Heun
+   dynamics.Midpoint
+   dynamics.RK12
+   dynamics.RK23
+   dynamics.RK4
+   dynamics.RK45
+```
+The corresponding integrator is then automatically constructed within the TDVP driver.
+
+
+### Abstract classes
+Those are the abstract classes you can inherit from to implement your own solver
+```{eval-rst}
+.. currentmodule:: netket.experimental
+```
+
+```{eval-rst}
+.. autosummary::
+   :toctree: _generated/experimental/dynamics
+   :template: class
+   :nosignatures:
+
+   dynamics.AbstractSolver
+   dynamics.AbstractSolverState
+```
+
+
+## Observables
+
+The observables previously in `netket.experimental.observable` have been moved to {mod}`netket.observable`.
